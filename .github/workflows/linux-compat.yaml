@@ -1,0 +1,126 @@
+name: Linux Compatibility Build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-compat-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  linux-compat:
+    name: Static x86_64 musl and runtime tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-compat-x86_64-musl
+      - name: Install static build dependencies
+        run: sudo apt-get update && sudo apt-get install -y musl-tools binutils
+      - name: Test the musl build including v2 transport
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: cargo test --target x86_64-unknown-linux-musl --features ureq-support --locked
+      - name: Build a static compatibility binary (no UPX)
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: cargo build --target x86_64-unknown-linux-musl --features ureq-support --profile minimal --locked
+      - name: Verify static linkage and prepare package
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary=target/x86_64-unknown-linux-musl/minimal/komari-monitor-rs
+          file "$binary"
+          readelf -lW "$binary" | tee program-headers.txt
+          readelf -dW "$binary" | tee dynamic-section.txt
+          if grep -q 'INTERP' program-headers.txt || grep -q '(NEEDED)' dynamic-section.txt; then
+            echo 'Compatibility binary must not need a dynamic loader or shared libraries' >&2
+            exit 1
+          fi
+          if readelf --version-info "$binary" | grep -q 'GLIBC_'; then
+            echo 'Unexpected GLIBC symbol dependency' >&2
+            exit 1
+          fi
+          mkdir -p dist
+          install -m 755 "$binary" dist/komari-monitor-rs-linux-x86_64-musl
+          dist/komari-monitor-rs-linux-x86_64-musl --version | grep -Fx 'komari-monitor-rs 0.4.0'
+      - name: Run the release binary in Debian 11, Debian 12 and Alpine
+        shell: bash
+        run: |
+          set -euo pipefail
+          for image in debian:bullseye-slim debian:bookworm-slim alpine:3.22; do
+            echo "=== Runtime smoke test: $image ==="
+            docker run --rm --network none -v "$PWD/dist:/package:ro" "$image" sh -ec '
+              cat /etc/os-release
+              /package/komari-monitor-rs-linux-x86_64-musl --version
+              /package/komari-monitor-rs-linux-x86_64-musl --help >/dev/null
+              /package/komari-monitor-rs-linux-x86_64-musl --dry-run
+            '
+          done
+      - name: Package provenance and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, pathlib, tomllib
+          version = tomllib.loads(pathlib.Path('Cargo.toml').read_text())['package']['version']
+          record = {
+              'version': version,
+              'commit': os.environ['GITHUB_SHA'],
+              'repository': os.environ['GITHUB_REPOSITORY'],
+              'target': 'x86_64-unknown-linux-musl',
+              'http_backend': 'ureq-support',
+              'upx': False,
+              'verification': ['musl unit and v2 transport tests', 'no ELF interpreter, NEEDED libraries or GLIBC versions', 'version/help/dry-run in Debian 11, Debian 12 and Alpine'],
+          }
+          pathlib.Path('dist/BUILD-INFO.json').write_text(json.dumps(record, indent=2) + '\n')
+          PY
+          cd dist
+          sha256sum komari-monitor-rs-linux-x86_64-musl BUILD-INFO.json > SHA256SUMS
+          sha256sum -c SHA256SUMS
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-x86_64-static-compat
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish verified compatibility release
+    needs: linux-compat
+    if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: linux-x86_64-static-compat
+          path: dist
+      - name: Verify downloaded artifact
+        run: cd dist && sha256sum -c SHA256SUMS
+      - uses: softprops/action-gh-release@v3
+        with:
+          tag_name: linux-compat-${{ github.run_number }}
+          target_commitish: ${{ github.sha }}
+          name: Komari Monitor RS 0.4.0 - Linux x86_64 static compatibility
+          body: |
+            Static musl build from current fork source, using ureq-support; no UPX compression.
+            No system glibc upgrade or musl installation is needed.
+            Verified: unit and v2 transport tests; no ELF interpreter/shared-library/GLIBC version dependencies; version, help and hardware dry-run in Debian 11, Debian 12 and Alpine containers.
+            Container tests do not guarantee every legacy kernel or hosting restriction is supported.
+            This is an additional x86_64 compatibility package. The existing latest release and GNU packages are unchanged.
+            Source commit: ${{ github.sha }}
+            SHA256SUMS and BUILD-INFO.json are included.
+          files: dist/*
+          fail_on_unmatched_files: true
+          make_latest: false
+          draft: false
+          prerelease: false
