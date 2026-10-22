@@ -61,7 +61,12 @@ jobs:
             docker run --rm --network none -v "$PWD/dist:/package:ro" "$image" sh -ec '
               cat /etc/os-release
               /package/komari-monitor-rs-linux-x86_64-musl --version
-              /package/komari-monitor-rs-linux-x86_64-musl --help >/dev/null
+              # palc prints valid help to stderr and exits 1; check its output too.
+              help_rc=0
+              /package/komari-monitor-rs-linux-x86_64-musl --help >/tmp/help.txt 2>&1 || help_rc=$?
+              test "$help_rc" -le 1
+              grep -q "Usage: komari-monitor-rs-linux-x86_64-musl" /tmp/help.txt
+              grep -q -- "--http-server" /tmp/help.txt
               /package/komari-monitor-rs-linux-x86_64-musl --dry-run
             '
           done
